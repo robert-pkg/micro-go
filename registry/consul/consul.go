@@ -263,6 +263,7 @@ func (c *consulRegistry) String() string {
 	return "consul"
 }
 
+// NewRegistry .
 func NewRegistry(opts ...registry.Option) (registry.Registry, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())

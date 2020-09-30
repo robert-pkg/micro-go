@@ -1,37 +1,26 @@
-package grpc
+package http
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/robert-pkg/micro-go/rpc/codec"
-
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pkg/errors"
+
 	"github.com/robert-pkg/micro-go/log"
 	"github.com/robert-pkg/micro-go/registry"
 	"github.com/robert-pkg/micro-go/rpc"
-
-	rpc_metadata "github.com/robert-pkg/micro-go/rpc/metadata"
 	"github.com/robert-pkg/micro-go/trace"
-	grpc_go "google.golang.org/grpc"
-	grpc_metadata "google.golang.org/grpc/metadata"
 )
 
 var (
 	// ErrNoAvailableConn .
 	ErrNoAvailableConn = errors.New("no available connection.")
 )
-
-// 服务实例
-type serverInstance struct {
-	service *registry.Service
-}
 
 // Client .
 type Client struct {
@@ -43,10 +32,9 @@ type Client struct {
 	pos          int
 	instanceList []*serverInstance
 	instanceMap  map[string]*serverInstance
-	connMap      map[string]*grpc_go.ClientConn // grpc 连接
 
-	applyChan  chan struct{}            // 申请channal
-	grantChan  chan *grpc_go.ClientConn // 发放channal
+	applyChan  chan struct{}        // 申请channal
+	grantChan  chan *serverInstance // 发放channal
 	updateChan chan *registry.Result
 }
 
@@ -56,10 +44,9 @@ func NewClient(serviceName string) (*Client, error) {
 		serviceName:  serviceName,
 		instanceList: make([]*serverInstance, 0, 5),
 		instanceMap:  make(map[string]*serverInstance),
-		connMap:      make(map[string]*grpc_go.ClientConn),
 
 		applyChan:  make(chan struct{}),
-		grantChan:  make(chan *grpc_go.ClientConn),
+		grantChan:  make(chan *serverInstance),
 		updateChan: make(chan *registry.Result),
 	}
 
@@ -116,7 +103,7 @@ func (c *Client) run() {
 
 			c.updateInstance(res)
 		case <-c.applyChan:
-			c.grantChan <- c.getBestConn()
+			c.grantChan <- c.getBestInstance()
 
 		}
 
@@ -124,7 +111,7 @@ func (c *Client) run() {
 
 }
 
-func (c *Client) getBestConn() *grpc_go.ClientConn {
+func (c *Client) getBestInstance() *serverInstance {
 
 	if len(c.instanceList) <= 0 {
 		// 刚创建Client, watch的数据还没来得及过来,
@@ -160,27 +147,11 @@ func (c *Client) getBestConn() *grpc_go.ClientConn {
 
 	c.change2NextPos()
 
-	if existConn, ok := c.connMap[bestKey]; ok {
-		return existConn
+	if existInstance, ok := c.instanceMap[bestKey]; ok {
+		return existInstance
 	}
 
-	// Set up a connection to the server.
-	var backoffConfig grpc_go.BackoffConfig
-	backoffConfig.MaxDelay = time.Second * 10
-
-	tracer := opentracing.GlobalTracer()
-	conn, err := grpc_go.Dial(bestKey, grpc_go.WithInsecure(),
-		grpc_go.WithBackoffConfig(backoffConfig),
-		grpc_go.WithDefaultCallOptions(grpc_go.CallContentSubtype(codec.JsonCodec{}.Name()), grpc_go.ForceCodec(codec.JsonCodec{})),
-		grpc_go.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(trace.ClientInterceptor(tracer))))
-
-	if err != nil {
-		log.Error("err", "err", err)
-		return nil
-	}
-
-	c.connMap[bestKey] = conn
-	return conn
+	return nil
 }
 
 func (c *Client) checkPos() {
@@ -229,11 +200,16 @@ func (c *Client) updateInstance(res *registry.Result) {
 			delete(c.instanceMap, key)
 		}
 
-		if conn, ok := c.connMap[key]; ok {
-			conn.Close()
-			delete(c.connMap, key)
-		}
 	}
+}
+
+func (c *Client) getExistRequestID(ctx context.Context) string {
+	reqID := ctx.Value(rpc.RequestID)
+	if reqID != nil {
+		return reqID.(string)
+	}
+
+	return ""
 }
 
 // RawCall .
@@ -242,14 +218,9 @@ func (c *Client) RawCall(ctx context.Context, method string, reqData []byte) ([]
 	var reqID string
 	ctx, reqID = rpc.GetOrCreateReqIDFromCtx(ctx)
 
-	md, _ := rpc_metadata.FromContext(ctx)
-
-	// 创建一个新的ctx， 用于 传送数据给 grpc server
-	ctx = grpc_metadata.NewOutgoingContext(ctx, grpc_metadata.New(md))
-
 	c.applyChan <- struct{}{}
-	conn := <-c.grantChan
-	if conn == nil {
+	serverInstance := <-c.grantChan
+	if serverInstance == nil {
 		return nil, ErrNoAvailableConn
 	}
 
@@ -258,12 +229,10 @@ func (c *Client) RawCall(ctx context.Context, method string, reqData []byte) ([]
 
 		if parentSpanContext := ctx.Value("ParentSpanContext"); parentSpanContext == nil {
 			var rootSpan opentracing.Span
-			rootSpan, newTraceID, ctx = trace.NewRootSpan(ctx, tracer, "grpc-call", reqID)
+			rootSpan, newTraceID, ctx = trace.NewRootSpan(ctx, tracer, "http-call", reqID)
 			defer rootSpan.Finish()
 		}
 	}
-
-	realMethodName := fmt.Sprintf("/%s.%s/%s", c.serviceName, c.shortServiceName, method)
 
 	if true {
 		args := make([]interface{}, 0, 6)
@@ -273,12 +242,14 @@ func (c *Client) RawCall(ctx context.Context, method string, reqData []byte) ([]
 			args = append(args, "newTraceID", newTraceID)
 		}
 
-		log.Info("invoke grpc call", args...)
+		log.Info("invoke http call", args...)
 	}
 
-	var out []byte
-	if err := conn.Invoke(ctx, realMethodName, reqData, &out); err != nil {
-		log.Error("invoke grpc call fail", rpc.RequestID, reqID, "method", method, "err", err)
+	url := fmt.Sprintf("http://%s/api/%s/%s", serverInstance.GetAddr(), c.shortServiceName, method)
+
+	out, err := serverInstance.Call(ctx, http.MethodPost, url, reqData)
+	if err != nil {
+		log.Error("invoke http call fail", rpc.RequestID, reqID, "method", method, "err", err)
 		return nil, err
 	}
 

@@ -18,6 +18,10 @@ type Logger interface {
 	Log(level Level, msg string, v ...interface{})
 	// Logf writes a formatted log entry
 	Logf(level Level, format string, v ...interface{})
+	// SetReqMetaForGoroutine .
+	SetReqMetaForGoroutine(requestID string)
+	// DeleteMetaForGoroutine .
+	DeleteMetaForGoroutine()
 	// Close close log
 	Close()
 	// String returns the name of logger
@@ -30,6 +34,16 @@ func Init(opts ...Option) error {
 
 func Fields(fields map[string]interface{}) *Helper {
 	return DefaultLogger.Fields(fields)
+}
+
+// SetReqMetaForGoroutine .
+func SetReqMetaForGoroutine(requestID string) {
+	DefaultLogger.SetReqMetaForGoroutine(requestID)
+}
+
+// DeleteMetaForGoroutine .
+func DeleteMetaForGoroutine() {
+	DefaultLogger.DeleteMetaForGoroutine()
 }
 
 func Close() {

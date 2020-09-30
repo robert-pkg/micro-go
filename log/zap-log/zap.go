@@ -133,10 +133,6 @@ func (l *zaplog) Fields(fields map[string]interface{}) *log.Helper {
 	return log.NewHelper(zl)
 }
 
-func (l *zaplog) Error(err error) log.Logger {
-	return l.Fields(map[string]interface{}{"error": err})
-}
-
 func (l *zaplog) Log(level log.Level, msg string, args ...interface{}) {
 	l.RLock()
 	data := make([]zap.Field, 0, len(l.fields))
@@ -162,6 +158,15 @@ func (l *zaplog) Log(level log.Level, msg string, args ...interface{}) {
 		}
 	}
 
+	reqID := ""
+	value, ok := GetReqIDForGoroutine()
+	if ok {
+		reqID = value.(string)
+	}
+	if len(reqID) > 0 {
+		data = append(data, zap.String("requestID", reqID))
+	}
+
 	lvl := loggerToZapLevel(level)
 	switch lvl {
 	case zap.DebugLevel:
@@ -184,6 +189,15 @@ func (l *zaplog) Logf(level log.Level, format string, args ...interface{}) {
 		data = append(data, zap.Any(k, v))
 	}
 	l.RUnlock()
+
+	reqID := ""
+	value, ok := GetReqIDForGoroutine()
+	if ok {
+		reqID = value.(string)
+	}
+	if len(reqID) > 0 {
+		data = append(data, zap.String("requestID", reqID))
+	}
 
 	lvl := loggerToZapLevel(level)
 	msg := fmt.Sprintf(format, args...)

@@ -1,38 +1,28 @@
-package grpc
+package http
 
 import (
+	"context"
 	"fmt"
-	"net"
+	"net/http"
+	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
-
+	"github.com/robert-pkg/micro-go/log"
 	"github.com/robert-pkg/micro-go/registry"
 	"github.com/robert-pkg/micro-go/trace"
 	"github.com/robert-pkg/micro-go/utils"
-
-	"github.com/opentracing/opentracing-go"
-
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/robert-pkg/micro-go/log"
-
-	grpc_go "google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
-
-	"github.com/robert-pkg/micro-go/rpc/codec"
-	"google.golang.org/grpc/encoding"
 )
-
-// 系统目前支持的codec
-func init() {
-	encoding.RegisterCodec(codec.JsonCodec{})
-	encoding.RegisterCodec(codec.ProtoCodec{})
-}
 
 // Server .
 type Server struct {
-	srv *grpc_go.Server
+	engine  *gin.Engine
+	httpSvr *http.Server
+
+	serviceName      string
+	shortServiceName string
 
 	registry registry.Registry
 
@@ -41,24 +31,37 @@ type Server struct {
 }
 
 // NewServer create Server
-func NewServer(registry registry.Registry) *Server {
+func NewServer(registry registry.Registry, serviceName string) *Server {
 	s := &Server{
-		registry: registry,
+		registry:    registry,
+		serviceName: serviceName,
 	}
 
-	tracer := opentracing.GlobalTracer()
-	grpcOptions := grpc_go.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-		trace.ServerInterceptor(tracer),
-		grpc_prometheus.UnaryServerInterceptor))
+	if len(serviceName) > 0 {
+		nameList := strings.Split(serviceName, ".")
+		if len(nameList) > 0 {
+			s.shortServiceName = nameList[len(nameList)-1]
+		}
+	}
 
-	s.srv = grpc_go.NewServer(grpcOptions)
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+
+	if true {
+		m := make([]gin.HandlerFunc, 0, 2)
+		m = append(m, logger())
+
+		tracer := opentracing.GlobalTracer()
+		if tracer != nil {
+			m = append(m, trace.SetUpTraceForGinServer())
+		}
+
+		engine.Use(m...)
+	}
+
+	s.engine = engine
 
 	return s
-}
-
-// Server return the grpc server for registering service.
-func (s *Server) Server() *grpc_go.Server {
-	return s.srv
 }
 
 // Shutdown .
@@ -68,16 +71,26 @@ func (s *Server) Shutdown() error {
 		s.registry.Deregister(s.rsvc)
 	}
 
-	if s.srv != nil {
-		// 优雅退出
-		s.srv.GracefulStop()
+	// 关闭 http 服务器(优雅退出)
+	if s.httpSvr != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := s.httpSvr.Shutdown(ctx); err != nil {
+			log.Error("Server shutdown error", "err", err)
+		}
 	}
 
 	return nil
 }
 
+// GetShortServiceName .
+func (s *Server) GetShortServiceName() string {
+	return s.shortServiceName
+}
+
 // Start start server
-func (s *Server) Start(serviceName string) error {
+func (s *Server) Start() error {
 
 	var addr string
 	if true {
@@ -95,38 +108,30 @@ func (s *Server) Start(serviceName string) error {
 		addr = fmt.Sprintf("%s:%d", ipList[0], port)
 	}
 
-	log.Info("start", "serviceName", serviceName, "addr", addr)
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	s.httpSvr = &http.Server{
+		Addr:    addr,
+		Handler: s.engine,
 	}
 
-	//数据上报
-	grpc_prometheus.Register(s.srv)
-	grpc_prometheus.EnableHandlingTimeHistogram()
-
-	reflection.Register(s.srv)
 	go func() {
-		// Serve accepts incoming connections on the listener lis, creating a new
-		// ServerTransport and service goroutine for each.
-		// Serve will return a non-nil error unless Stop or GracefulStop is called.
-		if err := s.srv.Serve(lis); err != nil {
+		if err := s.httpSvr.ListenAndServe(); err != nil {
 			panic(err)
 		}
 	}()
 
-	if err = s.register(serviceName, addr); err != nil {
+	log.Info("start http server", "serviceName", s.serviceName, "addr", addr)
+	if err := s.register(addr); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s *Server) register(serviceName string, addr string) error {
+func (s *Server) register(addr string) error {
 
 	// register service
 	node := &registry.Node{
-		Id:       fmt.Sprintf("%s-%s", serviceName, addr),
+		Id:       fmt.Sprintf("%s-%s", s.serviceName, addr),
 		Address:  addr,
 		Metadata: make(map[string]string),
 	}
@@ -134,10 +139,10 @@ func (s *Server) register(serviceName string, addr string) error {
 	node.Metadata["registry"] = s.registry.String()
 	node.Metadata["server"] = s.String()
 	node.Metadata["transport"] = s.String()
-	node.Metadata["protocol"] = "grpc"
+	node.Metadata["protocol"] = "http"
 
 	service := &registry.Service{
-		Name:      serviceName,
+		Name:      s.serviceName,
 		Version:   "latest",
 		Nodes:     []*registry.Node{node},
 		Endpoints: make([]*registry.Endpoint, 0),
@@ -175,7 +180,13 @@ func (s *Server) register(serviceName string, addr string) error {
 	return nil
 }
 
+func (s *Server) GetEngine() *gin.Engine {
+	return s.engine
+}
+
+//
+
 // String .
 func (s *Server) String() string {
-	return "grpc"
+	return "http"
 }
